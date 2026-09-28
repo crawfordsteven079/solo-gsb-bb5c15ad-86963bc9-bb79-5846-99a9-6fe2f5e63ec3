@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -1978,7 +1979,7 @@ def list_events(
 _RESERVATION_COLS = (
     "reservation_id, payload_hash, status, tenant_id, route_id, cost, "
     "ttl_seconds, created_at, expire_at, confirmed_at, cancelled_at, "
-    "expired_at, buckets_json"
+    "expired_at, actual_cost, settled_at, buckets_json"
 )
 
 
@@ -2047,6 +2048,10 @@ def _reservation_out(
         "confirmed_at": row["confirmed_at"],
         "cancelled_at": row["cancelled_at"],
         "expired_at": row["expired_at"],
+        "actual_cost": (
+            None if row["actual_cost"] is None else float(row["actual_cost"])
+        ),
+        "settled_at": row["settled_at"],
         "replayed": bool(replayed),
         "buckets": _live_bucket_snapshot(
             conn, _reservation_bucket_keys(row), ts
@@ -2091,6 +2096,61 @@ def _refund_to_buckets(
             "UPDATE buckets SET balance=?, updated_at=? "
             "WHERE scope=? AND tenant_id=? AND route_id=?",
             (balance, now_iso, scope, tenant, route),
+        )
+
+
+def _charge_extra_from_buckets(
+    conn: sqlite3.Connection,
+    keys: list[tuple[str, str, str]],
+    extra: float,
+    now: datetime,
+) -> None:
+    """结算时实际用量超出预占量，向原命中桶统一补扣 extra。
+
+    与创建预占同一套补充/定时切换规则：先应用这些桶到期的定时切换并按当前
+    策略补充，再逐桶判足——**所有原桶都足够才统一扣减；任一不足则抛 409，
+    一个都不扣**（调用事务随 HTTPException 整体回滚，时间补充等中间更新也一并
+    撤销，预占保持 pending）。不产生 low_balance 事件（与预占预扣一致）。
+    """
+    _apply_due_changes(conn, keys, now)
+    now_iso = iso(now)
+    states: list[tuple[str, str, str, float, float, float]] = []
+    for scope, tenant, route in keys:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        b = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if pol is None or b is None:
+            # 防御：策略/桶均不支持删除，正常流程中预占创建时桶必然已存在
+            raise HTTPException(
+                409, "结算补扣失败：原命中桶已不存在，无法统一补扣"
+            )
+        balance = _refill(
+            b["balance"], b["updated_at"],
+            pol["capacity"], pol["refill_rate"], now,
+        )
+        states.append(
+            (scope, tenant, route, balance, float(pol["capacity"]),
+             float(pol["refill_rate"]))
+        )
+    if not all(balance + 1e-12 >= extra for _, _, _, balance, _, _ in states):
+        raise HTTPException(
+            409,
+            f"实际用量超出预占量 {extra:g}，但部分原命中桶补充后余额仍不足，"
+            "统一补扣失败，预占保持 pending、未扣款",
+        )
+    for scope, tenant, route, balance, _cap, _rate in states:
+        after = balance - float(extra)
+        conn.execute(
+            "UPDATE buckets SET balance=?, updated_at=? "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (after, now_iso, scope, tenant, route),
         )
 
 
@@ -2260,8 +2320,8 @@ def create_reservation(
         INSERT INTO reservations
             (reservation_id, payload_hash, payload_json, status, tenant_id,
              route_id, cost, ttl_seconds, created_at, expire_at, confirmed_at,
-             cancelled_at, expired_at, buckets_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+             cancelled_at, expired_at, actual_cost, settled_at, buckets_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)
         """,
         (
             reservation_id, digest,
@@ -2317,6 +2377,88 @@ def confirm_reservation(
         # 并发兜底：本事务持有写锁，期间无其他写者能改此行，理论上不可达
         raise HTTPException(
             409, f"reservation_id={reservation_id!r} 已到期（expired），无法确认"
+        )
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    return _reservation_out(conn, row, replayed=False, now=now)
+
+
+def settle_reservation(
+    conn: sqlite3.Connection, reservation_id: str, actual_cost: float
+) -> dict[str, Any]:
+    """结算预占：仅未到期 pending -> settled，按实际用量与预占量的差额调整原桶。
+
+    动桶前先做全局到期清扫（与取消同为余额写操作）：本预占若已到期会先转
+    expired（已返还），随后按终态规则返回 409——到期优先，结算与确认/取消
+    并发时只能有一个成功（BEGIN IMMEDIATE 串行化 + 条件 UPDATE）。
+
+    差额调整沿用原命中桶及现有补充、定时切换规则：
+      - actual_cost < cost：向原命中桶返还 cost - actual_cost（先计息/切换，
+        再加差额，以桶当前容量封顶）；
+      - actual_cost > cost：所有原命中桶补充后都足够 extra 才统一补扣；
+        任一不足 -> 409，事务整体回滚，预占保持 pending 且不扣款；
+      - actual_cost = cost：仅状态翻转为 settled，余额不变。
+
+    幂等：已 settled 的预占，actual_cost 同值重放原结果（replayed=True，
+    不再调整余额）；异值或在其他终态（confirmed/cancelled/expired/rejected）
+    上结算返回 409；未知 ID 返回 404。actual_cost 必须为有限非负数（422 由
+    Pydantic 保证，这里对直接调用再防御一次）。
+    """
+    if actual_cost < 0:
+        raise HTTPException(422, "actual_cost 必须为非负数")
+    if not math.isfinite(actual_cost):
+        raise HTTPException(422, "actual_cost 必须为有限数（不能为 NaN 或 Infinity）")
+
+    now = now_utc()
+    # 余额写操作：先把所有到期 pending 预占（可能含本预占）转为 expired 并返还
+    _expire_due_reservations(conn, now)
+
+    row = conn.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, f"reservation_id={reservation_id!r} 不存在")
+
+    if row["status"] == "settled":
+        # 同值重放原结果；异值 409（actual_cost 二进制往返，可直接精确比较）
+        if float(row["actual_cost"]) != float(actual_cost):
+            raise HTTPException(
+                409,
+                f"reservation_id={reservation_id!r} 已按 actual_cost="
+                f"{float(row['actual_cost']):g} 结算，不能以 actual_cost="
+                f"{float(actual_cost):g} 重复结算",
+            )
+        return _reservation_out(conn, row, replayed=True, now=now)
+    if row["status"] != "pending":
+        raise HTTPException(
+            409,
+            f"reservation_id={reservation_id!r} 当前状态为 {row['status']!r}，"
+            "只有未到期的 pending 预占可以结算",
+        )
+
+    now_iso = iso(now)
+    reserved = float(row["cost"])
+    keys = _reservation_bucket_keys(row)
+    if actual_cost < reserved - 1e-12:
+        # 实际用量少于预占量：返还差额，按当前容量封顶
+        _refund_to_buckets(conn, keys, reserved - float(actual_cost), now)
+    elif actual_cost > reserved + 1e-12:
+        # 实际用量多于预占量：所有原桶补充后都足够才统一补扣，否则内部抛 409
+        # 并随本事务整体回滚（保持 pending、不扣款）
+        _charge_extra_from_buckets(conn, keys, float(actual_cost) - reserved, now)
+
+    cur = conn.execute(
+        "UPDATE reservations SET status='settled', actual_cost=?, settled_at=? "
+        "WHERE reservation_id=? AND status='pending' AND expire_at > ?",
+        (float(actual_cost), now_iso, reservation_id, now_iso),
+    )
+    if cur.rowcount == 0:
+        # 事务开头的全局清扫之后不可能再到期；防御性 409
+        raise HTTPException(
+            409, f"reservation_id={reservation_id!r} 已到期或已非 pending，无法结算"
         )
     row = conn.execute(
         f"SELECT {_RESERVATION_COLS} FROM reservations WHERE reservation_id=?",

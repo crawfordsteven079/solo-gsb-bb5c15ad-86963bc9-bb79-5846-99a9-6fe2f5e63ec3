@@ -8,17 +8,21 @@
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
-POST /policies/impact-preview 预演、POST /reservations 预占
+POST /policies/impact-preview 预演、POST /reservations 预占（含确认/结算/取消）
 与 POST /quota-plans 配额规划接口保持匿名可用。
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from . import quota
 from .auth import AdminPrincipal, require_admin, reserve_nonce
@@ -42,8 +46,22 @@ from .schemas import (
     QuotaPlanOut,
     ReservationIn,
     ReservationOut,
+    ReservationSettleIn,
     RevokeOut,
 )
+
+
+def _sanitize_jsonable(value: Any) -> Any:
+    """把错误详情中的非有限浮点（NaN/Infinity）替换为字符串，保证 422 响应体
+    本身可被严格 JSON 序列化（pydantic 会把原始输入 nan 原样放进 errors 的
+    input 字段，默认 JSONResponse 序列化时会因此抛 ValueError 退化成 500）。"""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_jsonable(v) for v in value]
+    return value
 
 
 @asynccontextmanager
@@ -68,7 +86,10 @@ app = FastAPI(
         "未来 0～3600 秒请求序列的影响，双侧逐条对比，不落库。"
         "POST /reservations 提供配额预占：全部命中桶充足才统一预扣并保存原命中桶，"
         "否则全部不扣；支持确认（仅 pending->confirmed，不再扣减）、"
-        "取消（pending->cancelled，向原桶返还）与查询（到期惰性转 expired 并返还），"
+        "取消（pending->cancelled，向原桶返还）、结算（仅未到期 pending->settled："
+        "实际用量少于预占量返还差额并按容量封顶，多于预占量需所有原桶都足够才"
+        "统一补扣，否则 409 且保持 pending 不扣款；同值重放原结果，异值或其他"
+        "终态 409）与查询（到期惰性转 expired 并返还），"
         "预占 1～300 秒到期，所有余额写操作先在同一事务内完成到期返还。"
         "POST /quota-plans 在只读快照上为 1～18 个待执行请求规划配额内总收益最大的"
         "子集：同一时刻按现行策略补充各命中桶（未建桶按满额），不推进定时变更与"
@@ -77,7 +98,7 @@ app = FastAPI(
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
         "GET、裁决（含批量）、预演、撤销、预占与配额规划接口无需认证。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -88,6 +109,18 @@ def get_conn() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """与 FastAPI 默认 422 响应结构一致，但对错误详情里的 NaN/Infinity 做净化，
+    避免非有限输入（如 {"actual_cost": NaN}）因响应体无法序列化而退化成 500。"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_jsonable(jsonable_encoder(exc.errors()))},
+    )
 
 
 @app.get("/health")
@@ -467,6 +500,34 @@ def confirm_reservation(
     """
     with write_tx(conn):
         return quota.confirm_reservation(conn, reservation_id)
+
+
+@app.post(
+    "/reservations/{reservation_id}/settle",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={
+        404: {"description": "预占不存在"},
+        409: {"description": "预占已到期/已确认/已取消/已拒绝，或补扣时某原命中桶不足；已结算但 actual_cost 不一致"},
+        422: {"description": "actual_cost 为负数、NaN 或 Infinity"},
+    },
+)
+def settle_reservation(
+    reservation_id: str,
+    body: ReservationSettleIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    """结算预占：仅未到期 pending -> settled，按实际用量 actual_cost 调整原桶。
+
+    实际用量少于预占量则向原命中桶返还差额（先按当前策略补充/应用到期定时
+    切换，再以桶当前容量封顶）；多于预占量则所有原桶补充后都足够才统一补扣，
+    任一不足返回 409、预占保持 pending 且不扣款（事务整体回滚）。
+    结算与确认、取消并发时只能一个成功；到期优先（先持久化 expired 与返还再
+    409）。成功时保存 actual_cost 与 settled_at；同 actual_cost 重放原结果
+    （不重复扣款/返还），异值或在其他终态上结算返回 409；未知 ID 返回 404。
+    """
+    with write_tx(conn):
+        return quota.settle_reservation(conn, reservation_id, body.actual_cost)
 
 
 @app.post(
