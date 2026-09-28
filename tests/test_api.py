@@ -2480,6 +2480,371 @@ def test_concurrent_reservations_never_oversell(client):
     assert _global_balance(client) == 0.0
 
 
+# ------------------------------------------------------------ 预占结算（settle）
+
+
+def _settle(client, reservation_id, actual_cost):
+    return client.post(
+        f"/reservations/{reservation_id}/settle",
+        json={"actual_cost": actual_cost},
+    )
+
+
+def test_settle_less_actual_refunds_delta_and_persists(client, clock):
+    # 三级桶：容量 10/6/4，速率 0；预占 3 后 7/3/1；实际用量 1 -> 各返还 2
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 6, 0, tenant="t1")
+    put_policy(client, "route", 4, 0, tenant="t1", route="/r1")
+    _reserve(client, "rsv-s", 3, ttl=60, tenant="t1", route="/r1")
+    assert sorted((b["scope"], b["balance"]) for b in client.get("/buckets").json()) == [
+        ("global", 7.0), ("route", 1.0), ("tenant", 3.0),
+    ]
+
+    r = _settle(client, "rsv-s", 1)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "settled"
+    assert body["allowed"] is True
+    assert body["replayed"] is False
+    assert body["actual_cost"] == 1.0
+    assert body["settled_at"] == "2026-09-27T12:00:00Z"
+    assert [b["balance"] for b in body["buckets"]] == [9.0, 5.0, 3.0]
+    # 实际落库余额与响应一致（/buckets 按 scope 排序，用映射比较）
+    live = {(b["scope"], b["tenant_id"]): b["balance"]
+            for b in client.get("/buckets").json()}
+    assert live[("global", None)] == 9.0
+    assert live[("tenant", "t1")] == 5.0
+    assert live[("route", "t1")] == 3.0
+
+    # GET 展示结算信息
+    got = client.get("/reservations/rsv-s").json()
+    assert got["status"] == "settled"
+    assert got["actual_cost"] == 1.0
+    assert got["settled_at"] == "2026-09-27T12:00:00Z"
+
+    # 原确认行为保留：settled 上确认/取消均 409
+    assert client.post("/reservations/rsv-s/confirm").status_code == 409
+    assert client.post("/reservations/rsv-s/cancel").status_code == 409
+
+
+def test_settle_zero_actual_refunds_all(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-z", 4, ttl=60)
+    r = _settle(client, "rsv-z", 0)
+    assert r.status_code == 200
+    assert r.json()["status"] == "settled"
+    assert r.json()["actual_cost"] == 0.0
+    assert _global_balance(client) == 10.0  # 实际用量 0：全额返还
+
+
+def test_settle_refund_capped_at_current_capacity_after_refill(client, clock):
+    # 容量 10、10/s；预占 9 后余额 1；1 秒后补充到 10，结算 actual=0 返还 9，封顶 10
+    put_policy(client, "global", 10, 10)
+    _reserve(client, "rsv-cap", 9, ttl=60)
+    assert _global_balance(client) == 1.0
+    clock.advance(1)
+    body = _settle(client, "rsv-cap", 0).json()
+    assert body["status"] == "settled"
+    assert body["buckets"][0]["balance"] == 10.0
+    assert _global_balance(client) == 10.0
+
+
+def test_settle_more_actual_supplements_all_buckets(client, clock):
+    # 预占 2（余额 8），实际 5 -> 补扣 3，余额 5
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-m", 2, ttl=60)
+    assert _global_balance(client) == 8.0
+    r = _settle(client, "rsv-m", 5)
+    assert r.status_code == 200
+    assert r.json()["status"] == "settled"
+    assert r.json()["actual_cost"] == 5.0
+    assert _global_balance(client) == 5.0
+
+
+def test_settle_more_actual_insufficient_keeps_pending_and_no_deduction(client, clock):
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 4, 0, tenant="t1")
+    _reserve(client, "rsv-f", 2, ttl=60, tenant="t1")
+    # 全局余 8（补扣 7 后剩 1，足够）；租户余 2（补扣 7 不足）-> 整组 409
+    r = _settle(client, "rsv-f", 9)
+    assert r.status_code == 409
+    # 预占保持 pending，且一个桶都不扣
+    assert client.get("/reservations/rsv-f").json()["status"] == "pending"
+    rows = {b["scope"]: b["balance"] for b in client.get("/buckets").json()}
+    assert rows["global"] == 8.0
+    assert rows["tenant"] == 2.0
+    # 失败后仍可用可承受的值结算
+    assert _settle(client, "rsv-f", 3).status_code == 200  # 补扣 1
+    rows = {b["scope"]: b["balance"] for b in client.get("/buckets").json()}
+    assert rows["global"] == 7.0
+    assert rows["tenant"] == 1.0
+    assert client.get("/reservations/rsv-f").json()["status"] == "settled"
+
+
+def test_settle_equal_actual_settles_without_net_change(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-eq", 3, ttl=60)
+    r = _settle(client, "rsv-eq", 3)
+    assert r.status_code == 200
+    assert r.json()["status"] == "settled"
+    assert _global_balance(client) == 7.0
+
+
+def test_settle_replay_same_value_conflict_different_value(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-r", 3, ttl=60)
+    _settle(client, "rsv-r", 2)
+    assert _global_balance(client) == 8.0  # 7 + 返还差额 1
+
+    # 相同 actual_cost 重放原结果，不再扣补
+    again = _settle(client, "rsv-r", 2)
+    assert again.status_code == 200
+    assert again.json()["status"] == "settled"
+    assert again.json()["replayed"] is True
+    assert _global_balance(client) == 8.0
+
+    # 不同 actual_cost -> 409
+    assert _settle(client, "rsv-r", 2.5).status_code == 409
+    assert _settle(client, "rsv-r", 3).status_code == 409
+    assert _global_balance(client) == 8.0  # 冲突不改变余额  # 冲突不改变余额
+
+
+def test_settle_other_terminal_states_and_unknown_id(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-conf", 1, ttl=60)
+    client.post("/reservations/rsv-conf/confirm")
+    assert _settle(client, "rsv-conf", 1).status_code == 409
+
+    _reserve(client, "rsv-canc", 1, ttl=60)
+    client.post("/reservations/rsv-canc/cancel")
+    assert _settle(client, "rsv-canc", 1).status_code == 409
+
+    _reserve(client, "rsv-rej", 999, ttl=60)
+    assert _settle(client, "rsv-rej", 1).status_code == 409
+
+    assert _settle(client, "missing", 1).status_code == 404
+
+
+def test_settle_validation_rejects_negative_nan_infinity(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-v", 1, ttl=60)
+    assert _settle(client, "rsv-v", -0.01).status_code == 422
+    # NaN / Infinity 以 JSON 裸 token 发送：服务端安全返回 422（响应本身可序列化）
+    r = client.post(
+        "/reservations/rsv-v/settle",
+        content=b'{"actual_cost": NaN}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    r = client.post(
+        "/reservations/rsv-v/settle",
+        content=b'{"actual_cost": Infinity}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    # 校验失败不改变预占状态与余额
+    assert client.get("/reservations/rsv-v").json()["status"] == "pending"
+    assert _global_balance(client) == 9.0
+
+
+def test_settle_expiry_wins_and_persists_expired_with_refund(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-exp", 3, ttl=30)
+    assert _global_balance(client) == 7.0
+
+    # 恰好到期：结算前的独立清扫事务先转 expired 并返还并提交，随后结算 409
+    clock.advance(30)
+    r = _settle(client, "rsv-exp", 3)
+    assert r.status_code == 409
+    body = client.get("/reservations/rsv-exp").json()
+    assert body["status"] == "expired"
+    assert body["expired_at"] == "2026-09-27T12:00:30Z"
+    assert body["actual_cost"] is None and body["settled_at"] is None
+    assert _global_balance(client) == 10.0  # 到期已返还并持久化
+
+    # expired 上重复结算/确认/取消均 409，余额不变
+    assert _settle(client, "rsv-exp", 3).status_code == 409
+    assert client.post("/reservations/rsv-exp/confirm").status_code == 409
+    assert _global_balance(client) == 10.0
+
+
+def test_settle_sweeps_other_due_pending_before_settling(client, clock):
+    # 结算事务之前的独立清扫事务会先把其他到期预占转 expired 并返还（全局清扫），
+    # 结算随后看到的是返还后的余额
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-old", 5, ttl=10)
+    _reserve(client, "rsv-new", 2, ttl=60)
+    assert _global_balance(client) == 3.0
+    clock.advance(11)  # rsv-old 到期（返还 5），rsv-new 未到期
+    # rsv-new 实际用量 0：先返还 rsv-old（3->8），再返还 rsv-new 2（8->10）
+    body = _settle(client, "rsv-new", 0).json()
+    assert body["status"] == "settled"
+    assert _global_balance(client) == 10.0
+    assert client.get("/reservations/rsv-old").json()["status"] == "expired"
+
+
+def test_settle_concurrent_with_confirm_and_cancel_only_one_wins(client):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-x1", 2, ttl=300)
+    outcomes: list[tuple[str, int, str]] = []
+    lock = threading.Lock()
+
+    def op(name: str, fn) -> None:
+        r = fn()
+        with lock:
+            outcomes.append((name, r.status_code, r.json().get("status", "")))
+
+    threads = [
+        threading.Thread(
+            target=op, args=("settle", lambda: _settle(client, "rsv-x1", 1))
+        ),
+        threading.Thread(
+            target=op,
+            args=("confirm", lambda: client.post("/reservations/rsv-x1/confirm")),
+        ),
+        threading.Thread(
+            target=op,
+            args=("cancel", lambda: client.post("/reservations/rsv-x1/cancel")),
+        ),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [o for o in outcomes if o[1] == 200]
+    assert len(winners) == 1, outcomes
+    final = client.get("/reservations/rsv-x1").json()
+    assert final["status"] == winners[0][2]
+    # 余额必须与唯一胜出的终态语义一致：
+    # settled(actual1) -> 9；confirmed -> 8；cancelled -> 10
+    expected = {"settled": 9.0, "confirmed": 8.0, "cancelled": 10.0}[final["status"]]
+    assert _global_balance(client) == expected
+
+
+def test_settle_concurrent_same_reservation_only_one_wins(client):
+    # 20 个线程并发结算同一 pending 预占：只有一个首次结算成功，其余重放或 409
+    put_policy(client, "global", 30, 0)
+    _reserve(client, "rsv-cc", 2, ttl=300)
+    statuses: list[int] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        r = _settle(client, "rsv-cc", 1 + i)  # 每个线程不同 actual_cost
+        with lock:
+            statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 一个 200（首次结算成功），其余全部 409（settled 且异值）
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == 19
+    final = client.get("/reservations/rsv-cc").json()
+    assert final["status"] == "settled"
+    # 唯一成功的是 actual_cost=1+i 中的某个值；余额 = 30 - actual_cost
+    assert _global_balance(client) == 30.0 - final["actual_cost"]
+
+
+def test_settle_uses_scheduled_switch_rules_for_supplement(client, clock):
+    # 旧策略容量 10、速率 0；预占 4 后余额 6。10 秒后容量切换为 20：
+    # 结算时先按比例换算 6/10*20=12；实际用量 0 -> 返还 4 => 16
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "rsv-sw2", 4, ttl=100)
+    assert _global_balance(client) == 6.0
+    admin_call(
+        client, "POST", "/policy-changes",
+        {
+            "change_id": "chg-settle", "scope": "global",
+            "capacity": 20, "refill_rate": 0,
+            "effective_at": _iso(datetime(2026, 9, 27, 12, 0, 10, tzinfo=timezone.utc)),
+        },
+    )
+    clock.advance(10)
+    body = _settle(client, "rsv-sw2", 0).json()
+    assert body["status"] == "settled"
+    assert body["buckets"][0]["capacity"] == 20.0
+    assert body["buckets"][0]["balance"] == 16.0
+
+
+def test_settle_remains_anonymous(client, clock):
+    put_policy(client, "global", 10, 0)
+    _reserve(client, "anon-s", 1, ttl=60)
+    # 结算接口不带任何签名头即可访问
+    assert _settle(client, "anon-s", 1).status_code == 200
+
+
+def test_old_reservations_table_is_migrated_for_settle(tmp_path):
+    """老库 reservations 表（无 actual_cost / settled_at、status CHECK 不含
+    settled）init_db 后数据保留，并可正常结算。"""
+    import sqlite3
+
+    from app import database
+
+    db_file = tmp_path / "old_rsv.db"
+    conn = sqlite3.connect(str(db_file))
+    # 老版本 reservations 表结构
+    conn.execute(
+        """
+        CREATE TABLE reservations (
+            reservation_id TEXT PRIMARY KEY,
+            payload_hash   TEXT NOT NULL,
+            payload_json   TEXT NOT NULL,
+            status         TEXT NOT NULL
+                           CHECK (status IN ('pending', 'confirmed', 'cancelled',
+                                             'expired', 'rejected')),
+            tenant_id      TEXT NOT NULL DEFAULT '',
+            route_id       TEXT NOT NULL DEFAULT '',
+            cost           REAL NOT NULL CHECK (cost > 0),
+            ttl_seconds    INTEGER NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 300),
+            created_at     TEXT NOT NULL,
+            expire_at      TEXT NOT NULL,
+            confirmed_at   TEXT,
+            cancelled_at   TEXT,
+            expired_at     TEXT,
+            buckets_json   TEXT NOT NULL
+        ) STRICT
+        """
+    )
+    conn.execute(
+        "INSERT INTO reservations VALUES ("
+        "'old-1','h','{}','pending','','',3,60,"
+        "'2026-09-27T12:00:00Z','2026-09-27T12:01:00Z',NULL,NULL,NULL,"
+        "'[[\"global\",\"\",\"\"]]')"
+    )
+    conn.commit()
+    conn.close()
+
+    # 升级不抛错，旧数据保留且补了新列；再次 init_db 幂等
+    database.init_db(str(db_file))
+    database.init_db(str(db_file))
+    conn = database.connect(str(db_file))
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(reservations)")}
+        assert {"actual_cost", "settled_at"} <= cols
+        row = conn.execute(
+            "SELECT status, actual_cost, settled_at FROM reservations "
+            "WHERE reservation_id='old-1'"
+        ).fetchone()
+        assert row[0] == "pending" and row[1] is None and row[2] is None
+        # 新 CHECK 允许 settled 与新列写入
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE reservations SET status='settled', actual_cost=1.0, "
+            "settled_at='2026-09-27T12:00:05Z' WHERE reservation_id='old-1'"
+        )
+        conn.execute("COMMIT")
+        row = conn.execute(
+            "SELECT status, actual_cost FROM reservations WHERE reservation_id='old-1'"
+        ).fetchone()
+        assert row[0] == "settled" and row[1] == 1.0
+    finally:
+        conn.close()
+
+
 # ============================================================ 配额规划（POST /quota-plans）
 
 

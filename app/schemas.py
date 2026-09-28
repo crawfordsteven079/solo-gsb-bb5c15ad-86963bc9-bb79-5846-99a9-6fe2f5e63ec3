@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from __future__ import annotations
+
+import math
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -269,9 +272,31 @@ class ReservationIn(BaseModel):
     )
 
 
+class ReservationSettleIn(BaseModel):
+    actual_cost: float = Field(
+        ..., description="实际用量（令牌数）：必须为有限非负数（含 0）"
+    )
+
+    @field_validator("actual_cost", mode="before")
+    @classmethod
+    def _actual_cost_finite_non_negative(cls, v):
+        # ge=0 无法拒绝 NaN（NaN 比较恒为假）；非有限浮点在此显式拒绝为 422。
+        # 422 响应回显的非有限 input 由 main.py 的校验异常处理器统一安全序列化。
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("actual_cost 必须是非负数字")
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError("actual_cost 必须是有限数（不接受 NaN / Infinity）")
+        if f < 0:
+            raise ValueError("actual_cost 必须非负")
+        return f
+
+
 class ReservationOut(BaseModel):
     reservation_id: str
-    status: Literal["pending", "confirmed", "cancelled", "expired", "rejected"]
+    status: Literal[
+        "pending", "confirmed", "cancelled", "expired", "rejected", "settled"
+    ]
     allowed: bool = Field(
         ..., description="预占是否成功（status != rejected）；rejected 表示创建时桶不足，未扣余额"
     )
@@ -284,6 +309,12 @@ class ReservationOut(BaseModel):
     confirmed_at: Optional[str] = None
     cancelled_at: Optional[str] = None
     expired_at: Optional[str] = None
+    actual_cost: Optional[float] = Field(
+        default=None, description="结算实际用量；仅 status=settled 时非空"
+    )
+    settled_at: Optional[str] = Field(
+        default=None, description="结算完成时刻（ISO 8601 UTC）；仅 settled 时非空"
+    )
     replayed: bool = False
     buckets: list[BucketOut] = Field(
         ..., description="原命中桶按当前策略补充后的实时余额（只读快照）"

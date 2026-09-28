@@ -83,7 +83,7 @@
   预演**全程只读**：不改动策略、桶、裁决与事件数据，且无需认证。
 - **配额预占（reservation）**：`POST /reservations` 接收 `reservation_id`、`tenant_id`、
   `route_id`、正数 `cost` 与 **1～300 秒**的 `ttl_seconds`，复用多级桶与 SQLite
-  写事务完成「预扣 → 确认/取消/到期返还」：
+  写事务完成「预扣 → 确认 / 取消 / 结算（多退少补） / 到期返还」：
   - 创建预占与裁决同一套规则：事务内先应用命中且到期的定时切换、把**全部到期
     pending 预占**转为 `expired` 并返还，再补充并判定全部命中桶——**都充足才统一
     预扣 `cost`**，并把**原命中桶键快照**存档（`pending`）；任一不足则**一个都不扣**，
@@ -96,14 +96,29 @@
     **同一事务内向原命中桶返还 `cost`**；返还沿用当前补充与定时策略切换规则
     （先应用到期切换并按当前策略补充，再加 `cost`），最终余额**不超过桶当前容量**；
     重复取消幂等，**不再次返还**。
+  - **结算** `POST /reservations/{id}/settle`：请求体 `{"actual_cost": <有限非负数>}`，
+    仅**未到期的 `pending`** 可结算为 `settled`，沿用创建时保存的**原命中桶**与现有
+    补充、定时切换规则「多退少补」：
+    - 实际用量**少于**预占量：向各原桶**返还差额**（先按当前策略补充/应用到期切换，
+      再加差额），返还后余额**不超过桶当前容量**；
+    - 实际用量**多于**预占量：需要补扣差额，**所有原桶**（补充后）余额都足够时才
+      **统一补扣**；任一不足返回 **409**，预占**保持 pending 且不扣款**（可修正后重试）；
+    - 实际用量恰好等于预占量：无净扣补，仍可正常结算为 `settled`；
+    - 结算成功会保存 `actual_cost` 与 `settled_at`；相同 `actual_cost` 重放原结果
+      （`replayed=true`），**异值重放返回 409**；对 `confirmed` / `cancelled` /
+      `expired` / `rejected` 等其他终态结算返回 **409**；未知 ID 返回 **404**；
+      `actual_cost` 为负数、`NaN` 或 `Infinity` 返回 **422**。
   - **到期**：预占无后台任务，`expire_at = created_at + ttl_seconds`。**所有余额写
     操作**（裁决/批量裁决/撤销/策略 PUT/回滚，以及预占的确认与取消）动桶之前都在
     **同一 `BEGIN IMMEDIATE` 事务内**先把到期 `pending` 转为 `expired` 并向原桶返还；
     `GET /reservations/{id}` 查询时若该预占恰好到期，也在事务内完成这一清理。
-  - **确认/取消与到期竞争时以事务内时间为准、到期优先**：`expire_at <= 事务时刻`
-    时确认/取消一律先转为 `expired`（已返还）再返回 **409**；同一终态操作重复调用
-    幂等且不改变余额，其他终态之间的转换（如 confirmed 上取消、rejected 上确认）
-    返回 **409**；未知 ID 返回 **404**。
+    结算在其业务事务之前以**独立写事务**先完成这一全局清扫并提交，因此**到期优先**：
+    即使结算随后返回 409，`expired` 与返还也已持久化。
+  - **确认/取消/结算与到期竞争时以事务内时间为准、到期优先**：`expire_at <= 事务时刻`
+    时确认/取消/结算一律先转为 `expired`（已返还）再返回 **409**；同一终态操作重复
+    调用幂等且不改变余额，其他终态之间的转换（如 confirmed 上取消/结算、rejected 上
+    确认）返回 **409**；未知 ID 返回 **404**。结算与确认、取消并发时由各自的
+    `BEGIN IMMEDIATE` 事务串行化，条件更新保证**只有一个终态转换成功**。
   - 预占的预扣**不产生** `low_balance` 事件（事件只在获准裁决的扣减事务内写入）；
     预占接口全部**免认证**。
 - **配额规划（POST /quota-plans）**：为 **1～18** 个待执行请求在**只读快照**上选出
@@ -124,7 +139,7 @@
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
   （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
 `POST /policies/impact-preview` 预演、撤销、预占（`POST /reservations` 及其
-确认/取消/查询）与 `POST /quota-plans` 配额规划接口保持原样、无需认证**。
+确认/取消/结算/查询）与 `POST /quota-plans` 配额规划接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -176,8 +191,9 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 `docker compose down` 不会删除；如需清空：`docker compose down -v`。
 
 > **依赖安装与建表均随启动完成**：镜像构建时安装 `requirements.txt` 中的依赖；
-> 服务启动（FastAPI lifespan）时自动执行建表/老库迁移（含本版本新增的
-> `reservations` 表），无需任何手动初始化步骤。
+> 服务启动（FastAPI lifespan）时自动执行建表/老库迁移（含 `reservations` 表及
+> 结算所需的 `actual_cost` / `settled_at` / `settled` 状态，老库就地重建升级），
+> 无需任何手动初始化步骤。
 
 ### 配置项（环境变量）
 
@@ -333,7 +349,8 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/reservations` | 创建配额预占：全部命中桶充足才统一预扣并保存原命中桶，否则全部不扣（rejected）；同 ID 同载荷重放、异载荷 409 |
 | `POST` | `/reservations/{reservation_id}/confirm` | 确认预占：仅 pending→confirmed，不再扣减；重复确认幂等，其他终态 409 |
 | `POST` | `/reservations/{reservation_id}/cancel` | 取消预占：pending→cancelled，同事务向原桶返还 cost（不超过当前容量）；重复取消幂等，已到期先转 expired 再 409 |
-| `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间；该预占到期时在同一事务内清理为 expired 并返还 |
+| `POST` | `/reservations/{reservation_id}/settle` | 结算预占：仅未到期 pending→settled，按实际用量 actual_cost 多退少补（少用返还差额并封顶、多用原桶都足够才统一补扣，否则 409 保持 pending 不扣款）；同值重放、异值/其他终态 409、到期优先（先持久化 expired 与返还）、未知 ID 404、负数/NaN 422 |
+| `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间（settled 行含 actual_cost / settled_at）；该预占到期时在同一事务内清理为 expired 并返还 |
 | `POST` | `/quota-plans` | 只读规划：为 1～18 个待执行请求选出配额内总收益最大的子集（精确最优，同级并列比项数、再比升序 ID 字典序）；返回入选/未入选 ID、总收益与命中桶剩余额 |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
@@ -962,6 +979,8 @@ curl -s -X POST http://localhost:8000/reservations \
   "confirmed_at": null,
   "cancelled_at": null,
   "expired_at": null,
+  "actual_cost": null,
+  "settled_at": null,
   "replayed": false,
   "buckets": [
     {"scope": "global", "tenant_id": null, "route_id": null, "capacity": 10.0, "refill_rate": 0.0, "balance": 7.0},
@@ -971,14 +990,44 @@ curl -s -X POST http://localhost:8000/reservations \
 }
 ```
 
-> - `status` 生命周期：`pending → confirmed / cancelled / expired`；`rejected` 为
->   创建即拒绝的终态（**余额未扣**）。`allowed` 仅在 `rejected` 时为 `false`。
+结算成功（`POST /reservations/rsv-001/settle`，请求体
+`{"actual_cost": 2}`；预占 `cost=3`，故向三个原桶各返还差额 1）响应：
+
+```json
+{
+  "reservation_id": "rsv-001",
+  "status": "settled",
+  "allowed": true,
+  "tenant_id": "acme",
+  "route_id": "/v1/search",
+  "cost": 3.0,
+  "ttl_seconds": 60,
+  "created_at": "2026-09-27T12:00:00.000000Z",
+  "expire_at": "2026-09-27T12:01:00.000000Z",
+  "confirmed_at": null,
+  "cancelled_at": null,
+  "expired_at": null,
+  "actual_cost": 2.0,
+  "settled_at": "2026-09-27T12:00:05.000000Z",
+  "replayed": false,
+  "buckets": [
+    {"scope": "global", "balance": 8.0},
+    {"scope": "tenant", "tenant_id": "acme", "balance": 4.0},
+    {"scope": "route",  "tenant_id": "acme", "route_id": "/v1/search", "balance": 2.0}
+  ]
+}
+```
+
+> - `status` 生命周期：`pending → confirmed / cancelled / expired / settled`；
+>   `rejected` 为创建即拒绝的终态（**余额未扣**）。`allowed` 仅在 `rejected` 时为
+>   `false`。`settled` 行额外返回 `actual_cost`（实际用量）与 `settled_at`（结算时刻）。
 > - 相同 `reservation_id` + 相同载荷（`tenant_id` / `route_id` / `cost` /
 >   `ttl_seconds`）重放原结果（`replayed=true`，终态也原样返回，不重复扣减/返还）；
 >   异载荷返回 **409**。`cost<=0`、`ttl_seconds` 越界（非 1～300）、只给
 >   `route_id` 不给 `tenant_id` 返回 **422**；没有命中任何已配置策略返回 **404**。
 
-确认（仅状态翻转，不再扣减）、取消（向原桶返还，不超过当前容量）、查询：
+确认（仅状态翻转，不再扣减）、取消（向原桶返还，不超过当前容量）、
+结算（按实际用量多退少补）与查询：
 
 ```bash
 # 确认：pending -> confirmed，重复确认幂等（replayed=true）
@@ -987,27 +1036,38 @@ curl -s -X POST http://localhost:8000/reservations/rsv-001/confirm
 # 取消：pending -> cancelled，同事务向原命中桶返还 cost；重复取消幂等、不再次返还
 curl -s -X POST http://localhost:8000/reservations/rsv-001/cancel
 
-# 查询状态与到期时间；若恰好到期，同一事务内先转 expired 并返还再返回
+# 结算：仅未到期 pending -> settled，按 actual_cost 多退少补
+# 实际用量少于预占量：返还差额（封顶当前容量）；多于预占量：原桶都足够才统一补扣，
+# 否则 409 且保持 pending、不扣款；相同 actual_cost 重放原结果，异值 409
+curl -s -X POST http://localhost:8000/reservations/rsv-001/settle \
+  -H 'Content-Type: application/json' -d '{"actual_cost": 2.5}'
+
+# 查询状态与到期时间，settled 行含 actual_cost / settled_at；
+# 若恰好到期，同一事务内先转 expired 并返还再返回
 curl -s http://localhost:8000/reservations/rsv-001
 ```
 
 终态与竞争规则：
 
-| 当前状态 | confirm | cancel | 到期（expire_at ≤ 事务时刻） |
-| --- | --- | --- | --- |
-| `pending` | → `confirmed`，余额不变 | → `cancelled`，返还 `cost` | 任何余额写操作/查询先把它转 `expired` 并返还 |
-| `confirmed` | 幂等返回（`replayed=true`） | **409** | 保持 `confirmed`，不返还 |
-| `cancelled` | **409** | 幂等返回，**不再次返还** | 保持 `cancelled`（已在取消时返还） |
-| `expired` | **409** | **409** | 已返还，重复查询/重放不再改变余额 |
-| `rejected` | **409** | **409** | 无预扣，无需返还 |
+| 当前状态 | confirm | cancel | settle | 到期（expire_at ≤ 事务时刻） |
+| --- | --- | --- | --- | --- |
+| `pending` | → `confirmed`，余额不变 | → `cancelled`，返还 `cost` | → `settled`，按 `actual_cost` 多退少补（补扣不足保持 pending、409 不扣款） | 任何余额写操作/查询/结算前先把它转 `expired` 并返还 |
+| `confirmed` | 幂等返回（`replayed=true`） | **409** | **409** | 保持 `confirmed`，不返还 |
+| `cancelled` | **409** | 幂等返回，**不再次返还** | **409** | 保持 `cancelled`（已在取消时返还） |
+| `expired` | **409** | **409** | **409**（到期优先：expired 与返还已先持久化） | 已返还，重复查询/重放不再改变余额 |
+| `rejected` | **409** | **409** | **409** | 无预扣，无需返还 |
+| `settled` | **409** | **409** | 相同 `actual_cost` 幂等重放，异值 **409** | 保持 `settled`（终态，不返还） |
 
-> - **到期优先**：确认/取消与到期竞争时以**事务内时间**为唯一依据——
->   `expire_at` 已到则先在同一事务转 `expired` 并返还，再返回 **409**；
+> - **到期优先**：确认/取消/结算与到期竞争时以**事务内时间**为唯一依据——
+>   `expire_at` 已到则先转 `expired` 并返还，再返回 **409**；结算的到期清扫发生在
+>   结算业务事务**之前的独立写事务**并单独提交，因此即使结算因到期（或补扣不足）
+>   返回 409，`expired` 与返还也已持久化；
 > - **所有余额写操作**（`/decide`、`/decide-batches`、`/revoke`、`PUT /policies`、
->   `POST /policies/rollback`、预占确认/取消）动桶前都先在**同一事务内**完成到期
+>   `POST /policies/rollback`、预占确认/取消/结算）动桶前都先完成到期
 >   清扫与返还，因此到期转换、返还与随后的读改写原子提交，不会漏还或重复返还；
-> - 返还规则与撤销一致：先应用原桶到期的定时切换、按当前策略补充，再加 `cost`，
->   以桶**当前容量**为上限；预占的预扣与返还都**不产生** low_balance 事件。
+> - 返还规则与撤销一致：先应用原桶到期的定时切换、按当前策略补充，再加回令牌，
+>   以桶**当前容量**为上限；结算的补扣同样先补充/切换，且只有**所有原桶都足够**时
+>   才统一补扣差额；预占的预扣、返还与补扣都**不产生** low_balance 事件。
 
 ## 配额规划（POST /quota-plans，免认证、只读）
 
@@ -1117,11 +1177,19 @@ curl -s -X POST http://localhost:8000/quota-plans \
   - 确认只翻转 `pending → confirmed`，不触碰余额；取消与到期都把 `cost` 返还到
     **创建时的原命中桶**（即使之后补配/变更了其他层策略，返还目标不变），
     返还时按桶的当前策略计息、应用到期切换，并以当前容量为上限；
+  - 结算（`POST /reservations/{id}/settle`）只接受**有限非负**的 `actual_cost`，
+    且只允许**未到期的 pending**；少用则把差额返还到原命中桶（先计息/应用到期切换，
+    再以当前容量封顶），多用则在所有原桶补充后都足够时统一补扣差额，任一不足返回
+    409、预占保持 pending 且不扣款（业务事务整体回滚）；成功后保存 `actual_cost` 与
+    `settled_at`，相同值重放原结果、异值 409；
   - 到期无后台任务：余额写操作在事务开始时统一清扫，`GET /reservations/{id}`
-    只清理被查询的这一条；确认/取消在恰好到期的边界上以事务时间为准、到期优先；
-  - confirmed / cancelled / expired / rejected 均为终态：同一终态操作重复调用
-    幂等且不改变余额（重复取消不会二次返还、重放 expired 不会再次返还），
-    其他终态转换返回 409；预占的预扣与返还均不产生 low_balance 事件。
+    只清理被查询的这一条；确认/取消/结算在恰好到期的边界上以事务时间为准、到期优先
+    （结算的清扫在独立前序事务提交，到期的 expired 与返还在 409 时仍已持久化）；
+  - confirmed / cancelled / expired / rejected / settled 均为终态：同一终态操作
+    重复调用幂等且不改变余额（重复取消不会二次返还、重放 expired 不会再次返还、
+    settled 同值重放不再次扣补），其他终态转换返回 409；预占的预扣、返还与结算补扣
+    均不产生 low_balance 事件；结算与确认、取消并发时 BEGIN IMMEDIATE 串行化，
+    条件更新保证只有一个终态转换成功。
 - 配额规划（`POST /quota-plans`）的额外约定：
   - 全程在 `read_tx` 只读快照内演算：各命中桶按**现行**策略补充到同一快照时刻
     （未建桶按满额），**不应用**到期定时切换、**不清扫**到期预占、不创建桶、
@@ -1195,7 +1263,16 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 查询惰性清理单条到期预占并返还、所有余额写操作（裁决/撤销）事务内先全局清扫
 到期 pending 并返还（含部分到期、返还后再扣减）、到期预占重放不重复返还、
 返还与判足沿用定时切换规则（到期换算 + 容量截断 + 缩容后不足被拒）、
-其他终态转换 409 与未知 ID 404、四接口免认证、20 线程并发预占不超发。
+其他终态转换 409 与未知 ID 404、四接口免认证、20 线程并发预占不超发；
+预占结算覆盖：少用返还差额（多级，且 GET/落库余额一致）、actual=0 全额返还、
+返还按补充后当前容量封顶、多用在所有原桶充足时统一补扣、任一原桶不足 409 且
+保持 pending 不扣款（失败后可重试）、实际等于预占无净扣补、同值重放幂等与
+异值 409、confirmed/cancelled/rejected 409 与未知 ID 404、负数/NaN/Infinity 422、
+到期边界结算时到期优先（独立前序事务先持久化 expired 与返还再 409）、结算前全局
+清扫其他到期预占、结算与确认/取消并发只有一个终态转换成功且余额与胜出终态一致、
+20 线程并发结算同一预占只有一次成功、补扣沿用定时切换换算规则、结算免认证，
+以及老库 reservations 表（无 actual_cost/settled_at、CHECK 不含 settled）
+就地迁移后数据保留且可结算（迁移幂等）。
 配额规划覆盖：总收益最大的子集选择、多级共享桶约束、收益并列时项数优先、
 项数并列时升序 ID 字典序优先、快照余额与未建桶按满额、路由层匹配、
 未命中策略层的项恒可入选、无可行项返回空集、只读（不改桶/裁决/事件、
@@ -1207,10 +1284,10 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 ```
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations）与老库迁移（含 baseline 版本补登）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占与配额规划）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占四接口与 POST /quota-plans）
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations[actual_cost/settled_at/settled]）与老库迁移（baseline 版本补登、老 reservations 表就地重建升级）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/结算多退少补/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占[结算]与配额规划）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占五接口[含 settle]与 POST /quota-plans）
 tests/
   test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占与配额规划）
 Dockerfile

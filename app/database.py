@@ -151,13 +151,14 @@ BEGIN
 END;
 
 -- 配额预占（reservation）：创建时在同一写事务内对全部命中桶预扣 cost，
--- 并把命中桶键快照存入 buckets_json，供取消/到期按原桶返还。
+-- 并把命中桶键快照存入 buckets_json，供取消/到期/结算按原桶返还或补扣。
 -- status 生命周期：
 --   pending   -> confirmed（确认，仅状态翻转，余额不变）
 --              -> cancelled（取消，向原命中桶返还 cost）
 --              -> expired（到期未确认，惰性转为 expired 并向原桶返还）
---   rejected  为创建即拒绝的终态（余额未扣），可同载荷重放、不可确认/取消
--- 没有后台任务：到期 pending 由下一次余额写操作（或该预占自身的确认/查询）
+--              -> settled（结算：按 actual_cost 多退少补，见 POST .../settle）
+--   rejected  为创建即拒绝的终态（余额未扣），可同载荷重放、不可确认/取消/结算
+-- 没有后台任务：到期 pending 由下一次余额写操作（或该预占自身的确认/查询/结算）
 -- 在同一 BEGIN IMMEDIATE 事务内惰性转 expired 并返还。
 CREATE TABLE IF NOT EXISTS reservations (
     reservation_id TEXT PRIMARY KEY,
@@ -165,7 +166,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     payload_json   TEXT NOT NULL,
     status         TEXT NOT NULL
                    CHECK (status IN ('pending', 'confirmed', 'cancelled',
-                                     'expired', 'rejected')),
+                                     'expired', 'rejected', 'settled')),
     tenant_id      TEXT NOT NULL DEFAULT '',
     route_id       TEXT NOT NULL DEFAULT '',
     cost           REAL NOT NULL CHECK (cost > 0),
@@ -175,7 +176,10 @@ CREATE TABLE IF NOT EXISTS reservations (
     confirmed_at   TEXT,
     cancelled_at   TEXT,
     expired_at     TEXT,
-    -- 创建时命中桶键列表的 JSON（[["global","",""], ...]），返还时按此定位原桶
+    -- 结算实际用量（有限非负）：仅 settled 行非空
+    actual_cost    REAL CHECK (actual_cost IS NULL OR actual_cost >= 0),
+    settled_at     TEXT,
+    -- 创建时命中桶键列表的 JSON（[["global","",""], ...]），返还/补扣时按此定位原桶
     buckets_json   TEXT NOT NULL
 ) STRICT;
 
@@ -269,6 +273,65 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+    # 老库 reservations 表（结算功能上线前）：status CHECK 不含 settled、
+    # 且缺少 actual_cost / settled_at 列。SQLite 不能直接改 CHECK 约束，
+    # 在单个事务内「改名旧表 -> 建新表 -> 拷数据 -> 删旧表 -> 建索引」就地升级，
+    # 已有的 pending/confirmed/cancelled/expired/rejected 数据原样保留。
+    rsv_cols = {row["name"] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if rsv_cols and "actual_cost" not in rsv_cols:
+        conn.execute("BEGIN")
+        try:
+            conn.execute("ALTER TABLE reservations RENAME TO reservations_old")
+            conn.execute(
+                """
+                CREATE TABLE reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    payload_hash   TEXT NOT NULL,
+                    payload_json   TEXT NOT NULL,
+                    status         TEXT NOT NULL
+                                   CHECK (status IN ('pending', 'confirmed', 'cancelled',
+                                                     'expired', 'rejected', 'settled')),
+                    tenant_id      TEXT NOT NULL DEFAULT '',
+                    route_id       TEXT NOT NULL DEFAULT '',
+                    cost           REAL NOT NULL CHECK (cost > 0),
+                    ttl_seconds    INTEGER NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 300),
+                    created_at     TEXT NOT NULL,
+                    expire_at      TEXT NOT NULL,
+                    confirmed_at   TEXT,
+                    cancelled_at   TEXT,
+                    expired_at     TEXT,
+                    actual_cost    REAL CHECK (actual_cost IS NULL OR actual_cost >= 0),
+                    settled_at     TEXT,
+                    buckets_json   TEXT NOT NULL
+                ) STRICT
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO reservations
+                    (reservation_id, payload_hash, payload_json, status, tenant_id,
+                     route_id, cost, ttl_seconds, created_at, expire_at, confirmed_at,
+                     cancelled_at, expired_at, actual_cost, settled_at, buckets_json)
+                SELECT reservation_id, payload_hash, payload_json, status, tenant_id,
+                       route_id, cost, ttl_seconds, created_at, expire_at, confirmed_at,
+                       cancelled_at, expired_at, NULL, NULL, buckets_json
+                FROM reservations_old
+                """
+            )
+            # DROP 旧表会连带删除随 RENAME 归属旧表的 idx_reservations_due
+            conn.execute("DROP TABLE reservations_old")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_reservations_due
+                ON reservations (expire_at)
+                WHERE status = 'pending'
+                """
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 @contextmanager

@@ -9,16 +9,19 @@ DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
 POST /policies/impact-preview 预演、POST /reservations 预占
-与 POST /quota-plans 配额规划接口保持匿名可用。
+（含确认/取消/结算/查询）与 POST /quota-plans 配额规划接口保持匿名可用。
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from . import quota
 from .auth import AdminPrincipal, require_admin, reserve_nonce
@@ -42,6 +45,7 @@ from .schemas import (
     QuotaPlanOut,
     ReservationIn,
     ReservationOut,
+    ReservationSettleIn,
     RevokeOut,
 )
 
@@ -68,7 +72,9 @@ app = FastAPI(
         "未来 0～3600 秒请求序列的影响，双侧逐条对比，不落库。"
         "POST /reservations 提供配额预占：全部命中桶充足才统一预扣并保存原命中桶，"
         "否则全部不扣；支持确认（仅 pending->confirmed，不再扣减）、"
-        "取消（pending->cancelled，向原桶返还）与查询（到期惰性转 expired 并返还），"
+        "取消（pending->cancelled，向原桶返还）、结算（未到期 pending->settled，"
+        "按实际用量多退少补、补扣不足保持 pending 不扣款）"
+        "与查询（到期惰性转 expired 并返还），"
         "预占 1～300 秒到期，所有余额写操作先在同一事务内完成到期返还。"
         "POST /quota-plans 在只读快照上为 1～18 个待执行请求规划配额内总收益最大的"
         "子集：同一时刻按现行策略补充各命中桶（未建桶按满额），不推进定时变更与"
@@ -77,7 +83,7 @@ app = FastAPI(
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
         "GET、裁决（含批量）、预演、撤销、预占与配额规划接口无需认证。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -88,6 +94,34 @@ def get_conn() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+def _sanitize_jsonable(obj: Any) -> Any:
+    """把响应结构中的非有限浮点（NaN / Infinity）替换为安全字符串，
+    保证 422 校验错误即使回显了 NaN 输入也能正常 JSON 序列化。"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else f"<non-finite-float:{obj!s}>"
+    if isinstance(obj, dict):
+        return {k: _sanitize_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_jsonable(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # 与 FastAPI 默认 422 响应结构一致（仅保留可序列化的键，剔除含异常对象的 ctx），
+    # 另把回显输入中的非有限浮点替换为安全字符串，使 NaN / Infinity 输入的 422
+    # 错误响应自身也能正常 JSON 序列化。
+    detail = []
+    for err in exc.errors():
+        clean = {k: v for k, v in err.items() if k != "ctx"}
+        if "input" in clean:
+            clean["input"] = _sanitize_jsonable(clean["input"])
+        detail.append(clean)
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 @app.get("/health")
@@ -489,6 +523,49 @@ def cancel_reservation(
     """
     with write_tx(conn):
         return quota.cancel_reservation(conn, reservation_id)
+
+
+@app.post(
+    "/reservations/{reservation_id}/settle",
+    response_model=ReservationOut,
+    tags=["配额预占"],
+    responses={
+        404: {"description": "预占不存在"},
+        409: {
+            "description": (
+                "预占已到期（expired，到期优先：已先持久化 expired 与返还）/"
+                "已确认 / 已取消 / 已拒绝；或已按不同 actual_cost 结算；"
+                "或实际用量多于预占量但某原桶补充后余额不足补扣差额"
+                "（保持 pending、不扣款）"
+            )
+        },
+        422: {"description": "actual_cost 为负数、NaN 或 Infinity"},
+    },
+)
+def settle_reservation(
+    reservation_id: str,
+    body: ReservationSettleIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    """结算预占：仅未到期的 pending 可结算为 settled，按实际用量「多退少补」。
+
+    分两个串行写事务（同一连接）：
+      1. 先在独立事务内把全部到期 pending 预占（可能含本预占）转 expired 并返还，
+         单独提交——到期优先：本预占到期时随后返回 409，但 expired 与返还已持久化；
+      2. 结算事务沿用创建时保存的原命中桶键与现有补充、定时切换规则：
+         actual_cost < cost 向各原桶返还差额（按当前容量封顶）；
+         actual_cost > cost 时所有原桶补充后都足够才统一补扣差额，任一不足返回
+         409，事务整体回滚，预占保持 pending 且不扣款；actual_cost == cost 不净扣补。
+    已 settled：相同 actual_cost 重放原结果（replayed=true），异值 409；
+    其他终态 409；未知 ID 404。结算与确认、取消并发时由 BEGIN IMMEDIATE 串行化，
+    条件更新保证只有一个终态转换成功。免认证。
+    """
+    with write_tx(conn):
+        ts = quota.expire_due_reservations(conn)
+    with write_tx(conn):
+        return quota.settle_reservation(
+            conn, reservation_id, body.actual_cost, now=ts
+        )
 
 
 @app.get(
